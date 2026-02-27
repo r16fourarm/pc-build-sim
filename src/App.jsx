@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import "./App.css";
 
 const CATEGORIES = [
   "CPU",
@@ -29,20 +30,75 @@ function parsePriceToInt(input) {
 function guessNameFromUrl(url) {
   try {
     const u = new URL(url);
-    // Tokopedia: /<shop>/<product-slug>
     const parts = u.pathname.split("/").filter(Boolean);
-    const slug = parts[1] || parts[0] || "";
-    if (!slug) return "";
-    return slug
+
+    // Tokopedia: /shop/slug  |  lainnya: ambil part terakhir
+    const rawSlug = parts.length >= 2 ? parts[1] : parts[parts.length - 1] || "";
+    if (!rawSlug) return "";
+
+    // slug -> words
+    let words = rawSlug
       .replace(/[-_]+/g, " ")
-      .replace(/\b\d+\b/g, (m) => m) // biarin angka
+      .replace(/\s+/g, " ")
       .trim()
-      .toUpperCase();
+      .split(" ");
+
+    // buang angka tracking super panjang (misal 16+ digit)
+    words = words.filter((w) => !(w.length >= 14 && /^\d+$/.test(w)));
+
+    // buang kata sampah umum
+    const stop = new Set([
+      "official",
+      "ori",
+      "original",
+      "garansi",
+      "warranty",
+      "ready",
+      "stock",
+      "promo",
+      "murah",
+      "termurah",
+      "gratis",
+      "ongkir",
+      "free",
+      "diskon",
+      "best",
+      "seller",
+      "tokopedia",
+      "shopee",
+    ]);
+    words = words.filter((w) => !stop.has(w.toLowerCase()));
+
+    // rapihin casing + acronym
+    const acronyms = new Set([
+      "ssd", "nvme", "pcie", "gen3", "gen4", "ddr4", "ddr5", "ram", "gpu", "cpu",
+      "rtx", "gtx", "rx", "psu", "tb", "gb", "mhz", "hz", "m2", "m.2", "itx", "atx",
+    ]);
+
+    const titled = words
+      .map((w) => {
+        const lw = w.toLowerCase();
+
+        // keep numbers and sizes
+        if (/^\d+([.,]\d+)?(tb|gb|mhz|hz)$/i.test(w)) return w.toUpperCase();
+        if (/^\d+$/.test(w)) return w;
+
+        // acronym
+        if (acronyms.has(lw)) return w.toUpperCase();
+
+        // RTX3060 / RX6600
+        if (/^(rtx|gtx|rx)\d+/i.test(w)) return w.toUpperCase();
+
+        // normal Title Case
+        return lw.charAt(0).toUpperCase() + lw.slice(1);
+      })
+      .join(" ");
+
+    return titled.trim();
   } catch {
     return "";
   }
 }
-
 function buildShareText(items) {
   const grouped = new Map();
   for (const it of items) {
@@ -65,6 +121,210 @@ function buildShareText(items) {
   const total = items.reduce((s, it) => s + (it.price || 0), 0);
   out += `TOTAL: Rp ${formatRp(total)}\n`;
   return out;
+}
+
+/* ===============================
+   POWER ESTIMATOR SECTION
+   =============================== */
+
+/*
+  Helper: bulatkan PSU ke standar umum market
+  Contoh standar PSU:
+  450 / 550 / 650 / 750 / 850 / 1000
+*/
+function roundToPsuStandard(watt) {
+  const standards = [450, 550, 650, 750, 850, 1000];
+  return standards.find((s) => watt <= s) || 1000;
+}
+
+/*
+  Detect perkiraan watt CPU berdasarkan nama
+  Ini heuristic ringan (bukan database penuh)
+*/
+function detectCpuWatt(name) {
+  const n = name.toLowerCase();
+
+  // AMD Ryzen TDP umum
+  if (/ryzen\s*5\s*5600|ryzen\s*5\s*5500|ryzen\s*5\s*3600/.test(n)) return 65;
+  if (/ryzen\s*7\s*5800x/.test(n)) return 105;
+  if (/ryzen\s*9/.test(n)) return 105;
+
+  // Intel generasi umum
+  if (/i5-12400|i5 12400/.test(n)) return 65;
+  if (/i7-12700k|i9-12900k/.test(n)) return 125;
+
+  // fallback default CPU mid range
+  return 95;
+}
+
+/*
+  Detect perkiraan watt GPU berdasarkan nama
+*/
+function detectGpuWatt(name) {
+  const n = name.toLowerCase();
+
+  if (/rtx\s*3060/.test(n)) return 170;
+  if (/rtx\s*4060/.test(n)) return 115;
+  if (/rtx\s*3070/.test(n)) return 220;
+  if (/rtx\s*3080/.test(n)) return 320;
+  if (/rtx\s*4090/.test(n)) return 450;
+
+  if (/rx\s*6600/.test(n)) return 132;
+  if (/rx\s*6700/.test(n)) return 230;
+  if (/rx\s*6800/.test(n)) return 250;
+
+  // fallback GPU mid range
+  return 200;
+}
+
+/*
+  Main estimator function
+  Menghitung:
+  - CPU watt
+  - GPU watt
+  - Overhead 90W (mobo, ram, ssd, fan, dll)
+  - Headroom multiplier 1.5
+*/
+function estimatePower(items) {
+  const cpu = items.find((i) => i.category === "CPU");
+  const gpu = items.find((i) => i.category === "GPU");
+  const psu = items.find((i) => i.category === "PSU");
+
+  const cpuWatt = cpu ? detectCpuWatt(cpu.name) : 0;
+  const gpuWatt = gpu ? detectGpuWatt(gpu.name) : 0;
+
+  const overhead = 90; // asumsi komponen lain
+
+  const rawTotal = cpuWatt + gpuWatt + overhead;
+
+  const recommendedRaw = rawTotal * 1.5;
+  const recommendedPsu = roundToPsuStandard(recommendedRaw);
+
+  // Detect watt PSU dari nama jika ada angka seperti 550W
+  let selectedPsuWatt = 0;
+  if (psu) {
+    const match = psu.name.match(/(\d{3,4})\s*w/i);
+    if (match) selectedPsuWatt = parseInt(match[1]);
+  }
+
+  return {
+    cpuWatt,
+    gpuWatt,
+    overhead,
+    rawTotal,
+    recommendedPsu,
+    selectedPsuWatt,
+  };
+}
+
+/* ===============================
+   SOCKET COMPATIBILITY SECTION
+   =============================== */
+
+/*
+  Detect socket CPU dari nama
+*/
+function detectCpuSocket(name) {
+  const n = name.toLowerCase();
+
+  // AMD
+  if (/ryzen/.test(n)) return "AM4";
+  if (/am5/.test(n)) return "AM5";
+
+  // Intel generasi 12+
+  if (/12\d{2}|13\d{2}|14\d{2}/.test(n)) return "LGA1700";
+
+  // Intel lama
+  if (/10\d{2}|11\d{2}/.test(n)) return "LGA1200";
+
+  return null;
+}
+
+/*
+  Detect socket Motherboard dari nama
+*/
+function detectMoboSocket(name) {
+  const n = name.toLowerCase();
+
+  if (/b450|b550|x470|x570|a320/.test(n)) return "AM4";
+  if (/b650|x670/.test(n)) return "AM5";
+
+  if (/b660|z690|z790|h610/.test(n)) return "LGA1700";
+  if (/b460|z490/.test(n)) return "LGA1200";
+
+  return null;
+}
+
+/*
+  Check compatibility result
+*/
+function checkCpuMoboCompatibility(items) {
+  const cpu = items.find((i) => i.category === "CPU");
+  const mobo = items.find((i) => i.category === "Motherboard");
+
+  if (!cpu || !mobo) return null;
+
+  const cpuSocket = detectCpuSocket(cpu.name);
+  const moboSocket = detectMoboSocket(mobo.name);
+
+  if (!cpuSocket || !moboSocket) return null;
+
+  return {
+    cpuSocket,
+    moboSocket,
+    compatible: cpuSocket === moboSocket,
+  };
+}
+
+/* ===============================
+   DDR (RAM) COMPATIBILITY SECTION
+   =============================== */
+
+function detectRamDdr(name) {
+  const n = name.toLowerCase();
+  if (n.includes("ddr5")) return "DDR5";
+  if (n.includes("ddr4")) return "DDR4";
+  return null;
+}
+
+function detectMoboDdr(name) {
+  const n = name.toLowerCase();
+
+  // paling akurat kalau nama mobo mencantumkan DDR4/DDR5
+  if (n.includes("ddr5")) return "DDR5";
+  if (n.includes("ddr4")) return "DDR4";
+
+  // fallback heuristic chipset:
+  // AMD AM4 biasanya DDR4
+  if (/b450|b550|x470|x570|a320/.test(n)) return "DDR4";
+
+  // AMD AM5 biasanya DDR5
+  if (/b650|x670/.test(n)) return "DDR5";
+
+  // Intel:
+  // B660/Z690/Z790/H610 bisa DDR4 atau DDR5 → unknown kalau tidak tertulis
+  if (/b660|z690|z790|h610/.test(n)) return null;
+
+  // Intel lama umumnya DDR4
+  if (/b460|z490/.test(n)) return "DDR4";
+
+  return null;
+}
+
+function checkRamMoboDdr(items) {
+  const ram = items.find((i) => i.category === "RAM");
+  const mobo = items.find((i) => i.category === "Motherboard");
+  if (!ram || !mobo) return null;
+
+  const ramDdr = detectRamDdr(ram.name);
+  const moboDdr = detectMoboDdr(mobo.name);
+
+  // kalau salah satu tidak ketahuan, return null (nanti UI bilang "unknown")
+  if (!ramDdr || !moboDdr) {
+    return { ramDdr, moboDdr, compatible: null };
+  }
+
+  return { ramDdr, moboDdr, compatible: ramDdr === moboDdr };
 }
 
 function buildCsv(items) {
@@ -97,6 +357,7 @@ export default function App() {
         id: "default",
         name: "Build 1",
         items: [],
+        budget: 0, // 0 = belum set
       },
     },
   }));
@@ -110,6 +371,37 @@ export default function App() {
   const [url, setUrl] = useState("");
   const [note, setNote] = useState("");
 
+  //generate share link
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const data = params.get("data");
+
+    if (data) {
+      try {
+        const decoded = JSON.parse(
+          decodeURIComponent(escape(atob(data)))
+        );
+
+        const newId = crypto.randomUUID();
+
+        setBuilds({
+          activeId: newId,
+          byId: {
+            [newId]: {
+              id: newId,
+              name: decoded.name || "Shared Build",
+              items: decoded.items || [],
+            },
+          },
+        });
+
+        // remove param biar URL bersih
+        window.history.replaceState({}, "", "/");
+      } catch (err) {
+        console.error("Invalid share data");
+      }
+    }
+  }, []);
   // load
   useEffect(() => {
     try {
@@ -136,6 +428,18 @@ export default function App() {
     return activeBuild.items.reduce((s, it) => s + (it.price || 0), 0);
   }, [activeBuild.items]);
 
+  const power = useMemo(() => {
+    return estimatePower(activeBuild.items);
+  }, [activeBuild.items]);
+
+  const compatibility = useMemo(() => {
+    return checkCpuMoboCompatibility(activeBuild.items);
+  }, [activeBuild.items]);
+
+  const ddrCheck = useMemo(() => {
+    return checkRamMoboDdr(activeBuild.items);
+  }, [activeBuild.items]);
+
   function addItem() {
     const trimmedName = name.trim();
     const price = parsePriceToInt(priceInput);
@@ -153,6 +457,15 @@ export default function App() {
       addedAt: new Date().toISOString(),
     };
 
+    const SINGLE_CATEGORIES = new Set([
+      "CPU",
+      "Motherboard",
+      "GPU",
+      "PSU",
+      "Case",
+      "Monitor",
+    ]);
+
     setBuilds((prev) => {
       const b = prev.byId[prev.activeId];
       const updated = {
@@ -161,7 +474,9 @@ export default function App() {
           ...prev.byId,
           [prev.activeId]: {
             ...b,
-            items: [item, ...b.items],
+            items: SINGLE_CATEGORIES.has(category)
+              ? [item, ...b.items.filter((x) => x.category !== category)]
+              : [item, ...b.items],
           },
         },
       };
@@ -211,7 +526,7 @@ export default function App() {
       activeId: id,
       byId: {
         ...prev.byId,
-        [id]: { id, name, items: [] },
+        [id]: { id, name, items: [], budget: 0 },
       },
     }));
   }
@@ -226,6 +541,22 @@ export default function App() {
         [prev.activeId]: { ...prev.byId[prev.activeId], name: newName.trim() },
       },
     }));
+  }
+
+  function setActiveBudget(value) {
+    setBuilds((prev) => {
+      const b = prev.byId[prev.activeId];
+      return {
+        ...prev,
+        byId: {
+          ...prev.byId,
+          [prev.activeId]: {
+            ...b,
+            budget: value,
+          },
+        },
+      };
+    });
   }
 
   function deleteBuild() {
@@ -266,9 +597,24 @@ export default function App() {
 
   const buildOptions = Object.values(builds.byId);
 
+  function generateShareLink() {
+    const data = {
+      name: activeBuild.name,
+      items: activeBuild.items,
+    };
+
+    const json = JSON.stringify(data);
+    const encoded = btoa(unescape(encodeURIComponent(json)));
+
+    const url = `${window.location.origin}?data=${encoded}`;
+
+    navigator.clipboard.writeText(url);
+    alert("Share link copied!");
+  }
+
   // UI simpel tapi rapi
   return (
-    <div style={{ maxWidth: 980, margin: "0 auto", padding: 20, fontFamily: "system-ui" }}>
+    <div className="container">
       <h1 style={{ marginTop: 0 }}>PC Build Simulator</h1>
 
       {/* Build selector */}
@@ -291,6 +637,23 @@ export default function App() {
       </div>
 
       <hr style={{ opacity: 0.2, margin: "14px 0" }} />
+      {/* Budget */}
+      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+        <b>Budget (IDR):</b>
+        <input
+          value={activeBuild.budget ? String(activeBuild.budget) : ""}
+          onChange={(e) => {
+            const v = e.target.value.replace(/[^\d]/g, "");
+            setActiveBudget(v ? Number(v) : 0);
+          }}
+          placeholder="Contoh: 8500000"
+          inputMode="numeric"
+          style={{ padding: 10, width: 200 }}
+        />
+        <span style={{ opacity: 0.75 }}>
+          {activeBuild.budget ? `Rp ${formatRp(activeBuild.budget)}` : "Belum diset"}
+        </span>
+      </div>
 
       {/* Input */}
       <div style={{ display: "grid", gridTemplateColumns: "160px 1fr 180px 1fr", gap: 10 }}>
@@ -331,7 +694,14 @@ export default function App() {
           <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Link (opsional)</div>
           <input
             value={url}
-            onChange={(e) => setUrl(e.target.value)}
+            onChange={(e) => {
+              const v = e.target.value;
+              setUrl(v);
+              if (!name.trim()) {
+                const g = guessNameFromUrl(v);
+                if (g) setName(g);
+              }
+            }}
             placeholder="https://www.tokopedia.com/..."
             style={{ width: "100%", padding: 10 }}
           />
@@ -355,6 +725,9 @@ export default function App() {
         <button onClick={addItem}>+ Tambah</button>
         <button onClick={copyShare} disabled={!activeBuild.items.length}>Copy WA</button>
         <button onClick={exportCsv} disabled={!activeBuild.items.length}>Export CSV</button>
+        <button onClick={generateShareLink}>
+          Generate Share Link
+        </button>
         <button onClick={clearBuild} disabled={!activeBuild.items.length}>Clear Build</button>
       </div>
 
@@ -415,12 +788,231 @@ export default function App() {
 
       <hr style={{ opacity: 0.2, margin: "14px 0" }} />
 
+      <hr style={{ opacity: 0.2, margin: "14px 0" }} />
+
+      <h2>Power Estimate</h2>
+
+      <div style={{
+        border: "1px solid rgba(0,0,0,0.2)",
+        padding: 12,
+        borderRadius: 8,
+        marginBottom: 12
+      }}>
+
+        <div>CPU Estimate: {power.cpuWatt}W</div>
+        <div>GPU Estimate: {power.gpuWatt}W</div>
+        <div>Other Components (Overhead): {power.overhead}W</div>
+
+        <hr />
+
+        <div><b>Estimated Load: {power.rawTotal}W</b></div>
+        <div><b>Recommended PSU: {power.recommendedPsu}W</b></div>
+
+        {power.selectedPsuWatt > 0 && (
+          <div style={{
+            marginTop: 10,
+            color: power.selectedPsuWatt < power.recommendedPsu ? "red" : "green",
+            fontWeight: "bold"
+          }}>
+            {power.selectedPsuWatt < power.recommendedPsu
+              ? "⚠ PSU mungkin kurang daya!"
+              : "✓ PSU mencukupi"}
+          </div>
+        )}
+
+      </div>
+
+      <h2>Compatibility Check</h2>
+
+      <div style={{
+        border: "1px solid rgba(0,0,0,0.2)",
+        padding: 12,
+        borderRadius: 8,
+        marginBottom: 12
+      }}>
+
+        {!compatibility && (
+          <div style={{ opacity: 0.6 }}>
+            Add CPU and Motherboard to check compatibility
+          </div>
+        )}
+
+        {compatibility && (
+          <>
+            <div>CPU Socket: {compatibility.cpuSocket}</div>
+            <div>Motherboard Socket: {compatibility.moboSocket}</div>
+
+            <div style={{
+              marginTop: 10,
+              fontWeight: "bold",
+              color: compatibility.compatible ? "green" : "red"
+            }}>
+              {compatibility.compatible
+                ? "✓ CPU dan Motherboard kompatibel"
+                : "⚠ CPU dan Motherboard tidak kompatibel"}
+            </div>
+          </>
+        )}
+
+      </div>
+
+      <h2>DDR Check (RAM ↔ Motherboard)</h2>
+
+      <div
+        style={{
+          border: "1px solid rgba(0,0,0,0.2)",
+          padding: 12,
+          borderRadius: 8,
+          marginBottom: 12,
+        }}
+      >
+        {!ddrCheck && (
+          <div style={{ opacity: 0.6 }}>
+            Add RAM and Motherboard to check DDR compatibility
+          </div>
+        )}
+
+        {ddrCheck && (
+          <>
+            <div>RAM: {ddrCheck.ramDdr || "Unknown"}</div>
+            <div>Motherboard: {ddrCheck.moboDdr || "Unknown"}</div>
+
+            <div
+              style={{
+                marginTop: 10,
+                fontWeight: "bold",
+                color:
+                  ddrCheck.compatible === null
+                    ? "#999"
+                    : ddrCheck.compatible
+                      ? "green"
+                      : "red",
+              }}
+            >
+              {ddrCheck.compatible === null
+                ? "ℹ Tidak bisa memastikan (pastikan nama RAM/Mobo mencantumkan DDR4/DDR5)"
+                : ddrCheck.compatible
+                  ? "✓ RAM dan Motherboard kompatibel (DDR match)"
+                  : "⚠ RAM dan Motherboard tidak kompatibel (DDR beda)"}
+            </div>
+          </>
+        )}
+      </div>
+
+
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
         <div style={{ fontSize: 14, opacity: 0.75 }}>
           Saved otomatis di browser (localStorage). Kamu bisa bikin banyak build.
         </div>
         <div style={{ fontSize: 20 }}>
           TOTAL: <b>Rp {formatRp(total)}</b>
+        </div>
+      </div>
+
+
+      {/* Budget status */}
+      {activeBuild.budget > 0 && (
+        <div style={{ marginTop: 14 }}>
+          {(() => {
+            const budget = activeBuild.budget;
+            const diff = budget - total; // positif = sisa, negatif = over
+            const pct = Math.min(100, Math.round((total / budget) * 100));
+
+            const over = diff < 0;
+
+            return (
+              <div
+                style={{
+                  border: "1px solid rgba(0,0,0,0.2)",
+                  borderRadius: 10,
+                  padding: 12,
+                  marginBottom: 12,
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                  <div>
+                    <div style={{ opacity: 0.75, fontSize: 12 }}>Budget</div>
+                    <b>Rp {formatRp(budget)}</b>
+                  </div>
+                  <div>
+                    <div style={{ opacity: 0.75, fontSize: 12 }}>{over ? "Over Budget" : "Sisa Budget"}</div>
+                    <b style={{ color: over ? "red" : "green" }}>
+                      Rp {formatRp(Math.abs(diff))}
+                    </b>
+                  </div>
+                  <div>
+                    <div style={{ opacity: 0.75, fontSize: 12 }}>Progress</div>
+                    <b style={{ color: over ? "red" : "inherit" }}>{pct}%</b>
+                  </div>
+                </div>
+
+                <div style={{ marginTop: 10, height: 12, borderRadius: 999, background: "rgba(0,0,0,0.08)" }}>
+                  <div
+                    style={{
+                      width: `${pct}%`,
+                      height: "100%",
+                      borderRadius: 999,
+                      background: over ? "red" : "green",
+                    }}
+                  />
+                </div>
+
+                {over && (
+                  <div style={{ marginTop: 10, color: "red", fontWeight: "bold" }}>
+                    ⚠ Total melebihi budget.
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* Sticky Bottom Summary */}
+      <div
+        style={{
+          position: "fixed",
+          bottom: 0,
+          left: 0,
+          right: 0,
+          background: "#111",
+          color: "white",
+          padding: "12px 20px",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          boxShadow: "0 -2px 8px rgba(0,0,0,0.2)",
+          zIndex: 1000,
+        }}
+      >
+        <div>
+          <b>Total:</b> Rp {formatRp(total)}
+        </div>
+
+        <div>
+          {activeBuild.budget > 0 && (
+            <>
+              <b>Budget:</b> Rp {formatRp(activeBuild.budget)}{" "}
+              {total > activeBuild.budget ? (
+                <span style={{ color: "red" }}>⚠ Over</span>
+              ) : (
+                <span style={{ color: "lightgreen" }}>✓ OK</span>
+              )}
+            </>
+          )}
+        </div>
+
+        <div>
+          {power.selectedPsuWatt > 0 && (
+            <>
+              <b>PSU:</b>{" "}
+              {power.selectedPsuWatt < power.recommendedPsu ? (
+                <span style={{ color: "red" }}>Kurang</span>
+              ) : (
+                <span style={{ color: "lightgreen" }}>Aman</span>
+              )}
+            </>
+          )}
         </div>
       </div>
     </div>
