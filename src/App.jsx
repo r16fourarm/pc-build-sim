@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import "./App.css";
 
 const CATEGORIES = [
@@ -362,7 +362,9 @@ export default function App() {
     },
   }));
 
+  const nameInputRef = useRef(null);
   const activeBuild = builds.byId[builds.activeId];
+  const [compareId, setCompareId] = useState("");
 
   // form input
   const [category, setCategory] = useState("CPU");
@@ -370,6 +372,56 @@ export default function App() {
   const [priceInput, setPriceInput] = useState("");
   const [url, setUrl] = useState("");
   const [note, setNote] = useState("");
+
+  //compare build
+  const compareBuild = compareId ? builds.byId[compareId] : null;
+
+  const compareData = useMemo(() => {
+    if (!compareBuild) return null;
+
+    const a = activeBuild;
+    const b = compareBuild;
+
+    const totalA = calcTotal(a.items);
+    const totalB = calcTotal(b.items);
+
+    // map category -> first item (untuk kategori single)
+    const catMap = (items) => {
+      const m = new Map();
+      for (const it of items || []) {
+        if (!m.has(it.category)) m.set(it.category, []);
+        m.get(it.category).push(it);
+      }
+      return m;
+    };
+
+    const mapA = catMap(a.items);
+    const mapB = catMap(b.items);
+
+    const categories = Array.from(new Set([...mapA.keys(), ...mapB.keys()]));
+
+    const rows = categories.map((cat) => {
+      const aItems = mapA.get(cat) || [];
+      const bItems = mapB.get(cat) || [];
+
+      const aText = aItems.map((x) => `${x.name} (Rp ${formatRp(x.price)})`).join("\n") || "-";
+      const bText = bItems.map((x) => `${x.name} (Rp ${formatRp(x.price)})`).join("\n") || "-";
+
+      // beda kalau string beda (simple)
+      const different = aText !== bText;
+
+      return { cat, aText, bText, different };
+    });
+
+    return {
+      totalA,
+      totalB,
+      diff: totalA - totalB,
+      rows,
+      nameA: a.name,
+      nameB: b.name,
+    };
+  }, [activeBuild, compareBuild]);
 
   //generate share link
   useEffect(() => {
@@ -487,6 +539,50 @@ export default function App() {
     setPriceInput("");
     setUrl("");
     setNote("");
+  }
+
+  function calcTotal(items) {
+    return (items || []).reduce((sum, it) => sum + (Number(it.price) || 0), 0);
+  }
+
+  function quickPickCategory(cat) {
+    setCategory(cat);
+    setTimeout(() => {
+      const el = nameInputRef.current;
+      if (!el) return;
+
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.focus({ preventScroll: true }); // <— ini kuncinya
+    }, 0);
+  }
+
+  function duplicateBuild() {
+    setBuilds((prev) => {
+      const active = prev.byId[prev.activeId];
+      const id = crypto.randomUUID();
+
+      const copyName = active.name ? `${active.name} (Copy)` : "Copy Build";
+
+      // deep copy items supaya aman
+      const itemsCopy = (active.items || []).map((it) => ({
+        ...it,
+        id: crypto.randomUUID(), // id item baru
+      }));
+
+      return {
+        ...prev,
+        activeId: id,
+        byId: {
+          ...prev.byId,
+          [id]: {
+            id,
+            name: copyName,
+            items: itemsCopy,
+            budget: active.budget || 0,
+          },
+        },
+      };
+    });
   }
 
   function removeItem(itemId) {
@@ -621,6 +717,7 @@ export default function App() {
       <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
         <b>Build:</b>
         <select
+          className="select"
           value={builds.activeId}
           onChange={(e) => setBuilds((p) => ({ ...p, activeId: e.target.value }))}
         >
@@ -631,9 +728,10 @@ export default function App() {
           ))}
         </select>
 
-        <button onClick={createBuild}>+ New</button>
-        <button onClick={renameBuild}>Rename</button>
-        <button onClick={deleteBuild}>Delete</button>
+        <button className="btn" onClick={createBuild}>+ New</button>
+        <button className="btn" onClick={duplicateBuild}>Duplicate</button>
+        <button className="btn" onClick={renameBuild}>Rename</button>
+        <button className="btn" onClick={deleteBuild}>Delete</button>
       </div>
 
       <hr style={{ opacity: 0.2, margin: "14px 0" }} />
@@ -641,6 +739,7 @@ export default function App() {
       <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
         <b>Budget (IDR):</b>
         <input
+          className="input"
           value={activeBuild.budget ? String(activeBuild.budget) : ""}
           onChange={(e) => {
             const v = e.target.value.replace(/[^\d]/g, "");
@@ -659,7 +758,7 @@ export default function App() {
       <div style={{ display: "grid", gridTemplateColumns: "160px 1fr 180px 1fr", gap: 10 }}>
         <div>
           <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Kategori</div>
-          <select value={category} onChange={(e) => setCategory(e.target.value)} style={{ width: "100%", padding: 10 }}>
+          <select className="select" value={category} onChange={(e) => setCategory(e.target.value)} style={{ width: "100%", padding: 10 }}>
             {CATEGORIES.map((c) => (
               <option key={c} value={c}>{c}</option>
             ))}
@@ -669,6 +768,8 @@ export default function App() {
         <div>
           <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Nama Produk</div>
           <input
+            ref={nameInputRef}
+            className="input"
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="Contoh: ADATA LEGEND 710 1TB"
@@ -679,6 +780,7 @@ export default function App() {
         <div>
           <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Harga (IDR)</div>
           <input
+            className="input"
             value={priceInput}
             onChange={(e) => setPriceInput(e.target.value)}
             placeholder="Contoh: 1.279.000"
@@ -693,6 +795,7 @@ export default function App() {
         <div>
           <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Link (opsional)</div>
           <input
+            className="input"
             value={url}
             onChange={(e) => {
               const v = e.target.value;
@@ -713,6 +816,7 @@ export default function App() {
         <div style={{ gridColumn: "1 / -1" }}>
           <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Catatan (opsional)</div>
           <input
+            className="input"
             value={note}
             onChange={(e) => setNote(e.target.value)}
             placeholder="Contoh: garansi 3 tahun, seller official, dll"
@@ -722,13 +826,13 @@ export default function App() {
       </div>
 
       <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
-        <button onClick={addItem}>+ Tambah</button>
-        <button onClick={copyShare} disabled={!activeBuild.items.length}>Copy WA</button>
-        <button onClick={exportCsv} disabled={!activeBuild.items.length}>Export CSV</button>
-        <button onClick={generateShareLink}>
+        <button className="btn" onClick={addItem}>+ Tambah</button>
+        <button className="btn" onClick={copyShare} disabled={!activeBuild.items.length}>Copy WA</button>
+        <button className="btn" onClick={exportCsv} disabled={!activeBuild.items.length}>Export CSV</button>
+        <button className="btn" onClick={generateShareLink}>
           Generate Share Link
         </button>
-        <button onClick={clearBuild} disabled={!activeBuild.items.length}>Clear Build</button>
+        <button className="btn" onClick={clearBuild} disabled={!activeBuild.items.length}>Clear Build</button>
       </div>
 
       <hr style={{ opacity: 0.2, margin: "14px 0" }} />
@@ -739,8 +843,11 @@ export default function App() {
         return (
           <div key={cat} style={{ marginBottom: 14 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-              <h3 style={{ margin: 0 }}>{cat}</h3>
-              <span style={{ fontSize: 12, opacity: 0.7 }}>{catItems.length} item</span>
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <h3 style={{ margin: 0 }}>{cat}</h3>
+                <span className="badge">{catItems.length} item</span>
+              </div>
+              <button className="btn" onClick={() => quickPickCategory(cat)}>+ Add</button>
             </div>
 
             {catItems.length === 0 ? (
@@ -750,23 +857,15 @@ export default function App() {
                 {catItems.map((it) => (
                   <div
                     key={it.id}
-                    style={{
-                      border: "1px solid rgba(0,0,0,0.2)",
-                      borderRadius: 10,
-                      padding: 10,
-                      display: "flex",
-                      justifyContent: "space-between",
-                      gap: 10,
-                      alignItems: "flex-start",
-                    }}
+                    className="itemCard"
                   >
                     <div style={{ minWidth: 0 }}>
                       <b style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                         {it.name}
                       </b>
-                      {it.note ? <div style={{ fontSize: 12, opacity: 0.75 }}>{it.note}</div> : null}
+                      {it.note ? <div className="muted">{it.note}</div> : null}
                       {it.url ? (
-                        <div style={{ fontSize: 12, marginTop: 4 }}>
+                        <div className="muted" style={{ marginTop: 4 }}>
                           <a href={it.url} target="_blank" rel="noreferrer">{it.url}</a>
                         </div>
                       ) : null}
@@ -774,7 +873,7 @@ export default function App() {
 
                     <div style={{ textAlign: "right", whiteSpace: "nowrap" }}>
                       <div><b>Rp {formatRp(it.price)}</b></div>
-                      <button onClick={() => removeItem(it.id)} style={{ marginTop: 6 }}>
+                      <button className="btn btnDanger" onClick={() => removeItem(it.id)} style={{ marginTop: 6 }}>
                         Hapus
                       </button>
                     </div>
@@ -788,115 +887,101 @@ export default function App() {
 
       <hr style={{ opacity: 0.2, margin: "14px 0" }} />
 
-      <hr style={{ opacity: 0.2, margin: "14px 0" }} />
+      <div className="sectionGrid">
+        {/* POWER */}
+        <div className="card">
+          <h3>Power Estimate</h3>
 
-      <h2>Power Estimate</h2>
+          <div>CPU Estimate: {power.cpuWatt}W</div>
+          <div>GPU Estimate: {power.gpuWatt}W</div>
+          <div>Other Components (Overhead): {power.overhead}W</div>
 
-      <div style={{
-        border: "1px solid rgba(0,0,0,0.2)",
-        padding: 12,
-        borderRadius: 8,
-        marginBottom: 12
-      }}>
+          <hr className="hr" />
 
-        <div>CPU Estimate: {power.cpuWatt}W</div>
-        <div>GPU Estimate: {power.gpuWatt}W</div>
-        <div>Other Components (Overhead): {power.overhead}W</div>
-
-        <hr />
-
-        <div><b>Estimated Load: {power.rawTotal}W</b></div>
-        <div><b>Recommended PSU: {power.recommendedPsu}W</b></div>
-
-        {power.selectedPsuWatt > 0 && (
-          <div style={{
-            marginTop: 10,
-            color: power.selectedPsuWatt < power.recommendedPsu ? "red" : "green",
-            fontWeight: "bold"
-          }}>
-            {power.selectedPsuWatt < power.recommendedPsu
-              ? "⚠ PSU mungkin kurang daya!"
-              : "✓ PSU mencukupi"}
+          <div>
+            <b>Estimated Load: {power.rawTotal}W</b>
           </div>
-        )}
-
-      </div>
-
-      <h2>Compatibility Check</h2>
-
-      <div style={{
-        border: "1px solid rgba(0,0,0,0.2)",
-        padding: 12,
-        borderRadius: 8,
-        marginBottom: 12
-      }}>
-
-        {!compatibility && (
-          <div style={{ opacity: 0.6 }}>
-            Add CPU and Motherboard to check compatibility
+          <div>
+            <b>Recommended PSU: {power.recommendedPsu}W</b>
           </div>
-        )}
 
-        {compatibility && (
-          <>
-            <div>CPU Socket: {compatibility.cpuSocket}</div>
-            <div>Motherboard Socket: {compatibility.moboSocket}</div>
-
-            <div style={{
-              marginTop: 10,
-              fontWeight: "bold",
-              color: compatibility.compatible ? "green" : "red"
-            }}>
-              {compatibility.compatible
-                ? "✓ CPU dan Motherboard kompatibel"
-                : "⚠ CPU dan Motherboard tidak kompatibel"}
-            </div>
-          </>
-        )}
-
-      </div>
-
-      <h2>DDR Check (RAM ↔ Motherboard)</h2>
-
-      <div
-        style={{
-          border: "1px solid rgba(0,0,0,0.2)",
-          padding: 12,
-          borderRadius: 8,
-          marginBottom: 12,
-        }}
-      >
-        {!ddrCheck && (
-          <div style={{ opacity: 0.6 }}>
-            Add RAM and Motherboard to check DDR compatibility
-          </div>
-        )}
-
-        {ddrCheck && (
-          <>
-            <div>RAM: {ddrCheck.ramDdr || "Unknown"}</div>
-            <div>Motherboard: {ddrCheck.moboDdr || "Unknown"}</div>
-
+          {power.selectedPsuWatt > 0 && (
             <div
               style={{
                 marginTop: 10,
+                color: power.selectedPsuWatt < power.recommendedPsu ? "red" : "lightgreen",
                 fontWeight: "bold",
-                color:
-                  ddrCheck.compatible === null
-                    ? "#999"
-                    : ddrCheck.compatible
-                      ? "green"
-                      : "red",
               }}
             >
-              {ddrCheck.compatible === null
-                ? "ℹ Tidak bisa memastikan (pastikan nama RAM/Mobo mencantumkan DDR4/DDR5)"
-                : ddrCheck.compatible
-                  ? "✓ RAM dan Motherboard kompatibel (DDR match)"
-                  : "⚠ RAM dan Motherboard tidak kompatibel (DDR beda)"}
+              {power.selectedPsuWatt < power.recommendedPsu
+                ? "⚠ PSU mungkin kurang daya!"
+                : "✓ PSU mencukupi"}
             </div>
-          </>
-        )}
+          )}
+        </div>
+
+        {/* CPU ↔ MOBO */}
+        <div className="card">
+          <h3>Compatibility Check</h3>
+
+          {!compatibility && (
+            <div className="muted">Add CPU and Motherboard to check compatibility</div>
+          )}
+
+          {compatibility && (
+            <>
+              <div>CPU Socket: {compatibility.cpuSocket}</div>
+              <div>Motherboard Socket: {compatibility.moboSocket}</div>
+
+              <div
+                style={{
+                  marginTop: 10,
+                  fontWeight: "bold",
+                  color: compatibility.compatible ? "lightgreen" : "red",
+                }}
+              >
+                {compatibility.compatible
+                  ? "✓ CPU dan Motherboard kompatibel"
+                  : "⚠ CPU dan Motherboard tidak kompatibel"}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* DDR */}
+        <div className="card">
+          <h3>DDR Check (RAM ↔ Motherboard)</h3>
+
+          {!ddrCheck && (
+            <div className="muted">Add RAM and Motherboard to check DDR compatibility</div>
+          )}
+
+          {ddrCheck && (
+            <>
+              <div>RAM: {ddrCheck.ramDdr || "Unknown"}</div>
+              <div>Motherboard: {ddrCheck.moboDdr || "Unknown"}</div>
+
+              <div
+                style={{
+                  marginTop: 10,
+                  fontWeight: "bold",
+                  color:
+                    ddrCheck.compatible === null
+                      ? "rgba(234,240,255,.7)"
+                      : ddrCheck.compatible
+                        ? "lightgreen"
+                        : "red",
+                }}
+              >
+                {ddrCheck.compatible === null
+                  ? "ℹ Tidak bisa memastikan (pastikan nama RAM/Mobo mencantumkan DDR4/DDR5)"
+                  : ddrCheck.compatible
+                    ? "✓ RAM dan Motherboard kompatibel (DDR match)"
+                    : "⚠ RAM dan Motherboard tidak kompatibel (DDR beda)"}
+              </div>
+            </>
+          )}
+        </div>
       </div>
 
 
@@ -907,6 +992,82 @@ export default function App() {
         <div style={{ fontSize: 20 }}>
           TOTAL: <b>Rp {formatRp(total)}</b>
         </div>
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <h3>Compare Builds</h3>
+
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <div className="muted">Compare current build with:</div>
+
+          <select
+            className="select"
+            value={compareId}
+            onChange={(e) => setCompareId(e.target.value)}
+            style={{ maxWidth: 320 }}
+          >
+            <option value="">(None)</option>
+            {Object.values(builds.byId)
+              .filter((b) => b.id !== builds.activeId)
+              .map((b) => (
+                <option key={b.id} value={b.id}>
+                  {b.name}
+                </option>
+              ))}
+          </select>
+
+          {compareId && (
+            <button className="btn" onClick={() => setCompareId("")}>
+              Clear
+            </button>
+          )}
+        </div>
+
+        {compareData && (
+          <>
+            <hr className="hr" />
+
+            <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+              <div>
+                <div className="muted">{compareData.nameA}</div>
+                <b>Rp {formatRp(compareData.totalA)}</b>
+              </div>
+
+              <div>
+                <div className="muted">{compareData.nameB}</div>
+                <b>Rp {formatRp(compareData.totalB)}</b>
+              </div>
+
+              <div>
+                <div className="muted">Selisih (A - B)</div>
+                <b style={{ color: compareData.diff > 0 ? "red" : "lightgreen" }}>
+                  Rp {formatRp(Math.abs(compareData.diff))}{" "}
+                  {compareData.diff > 0 ? "(A lebih mahal)" : compareData.diff < 0 ? "(A lebih murah)" : "(Sama)"}
+                </b>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 14, display: "grid", gap: 10 }}>
+              {compareData.rows.map((r) => (
+                <div
+                  key={r.cat}
+                  className="card"
+                  style={{
+                    padding: 10,
+                    borderColor: r.different ? "rgba(255,107,107,.5)" : "rgba(124,255,158,.25)",
+                  }}
+                >
+                  <div style={{ fontWeight: "bold", marginBottom: 6 }}>{r.cat}</div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "inherit" }}>{r.aText}</pre>
+                    <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontFamily: "inherit" }}>{r.bText}</pre>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
       </div>
 
 
@@ -948,6 +1109,7 @@ export default function App() {
 
                 <div style={{ marginTop: 10, height: 12, borderRadius: 999, background: "rgba(0,0,0,0.08)" }}>
                   <div
+                    className="progressBar"
                     style={{
                       width: `${pct}%`,
                       height: "100%",
@@ -970,20 +1132,7 @@ export default function App() {
 
       {/* Sticky Bottom Summary */}
       <div
-        style={{
-          position: "fixed",
-          bottom: 0,
-          left: 0,
-          right: 0,
-          background: "#111",
-          color: "white",
-          padding: "12px 20px",
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          boxShadow: "0 -2px 8px rgba(0,0,0,0.2)",
-          zIndex: 1000,
-        }}
+        className="sticky"
       >
         <div>
           <b>Total:</b> Rp {formatRp(total)}
