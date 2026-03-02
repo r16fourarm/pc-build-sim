@@ -26,6 +26,14 @@ function parsePriceToInt(input) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function formatPriceInput(input) {
+  const digits = String(input ?? "").replace(/[^\d]/g, "");
+  if (!digits) return "";
+  const n = Number(digits);
+  if (!Number.isFinite(n)) return "";
+  return new Intl.NumberFormat("id-ID").format(n);
+}
+
 // Best-effort: ambil nama dari URL (slug) tanpa fetch (anti CORS)
 function guessNameFromUrl(url) {
   try {
@@ -141,19 +149,30 @@ function roundToPsuStandard(watt) {
   Detect perkiraan watt CPU berdasarkan nama
   Ini heuristic ringan (bukan database penuh)
 */
+
+
+function isIntelK(name) {
+  return /i[3579][ -]?\d{4,5}k/i.test(name) || /\b(kf|ks)\b/i.test(name.toLowerCase());
+}
+function isRyzen(name) {
+  return /ryzen/i.test(name);
+}
+
 function detectCpuWatt(name) {
   const n = name.toLowerCase();
 
-  // AMD Ryzen TDP umum
-  if (/ryzen\s*5\s*5600|ryzen\s*5\s*5500|ryzen\s*5\s*3600/.test(n)) return 65;
+  // AMD Ryzen common
+  if (/ryzen\s*5\s*(5600|5500|3600)/.test(n)) return 65;
   if (/ryzen\s*7\s*5800x/.test(n)) return 105;
   if (/ryzen\s*9/.test(n)) return 105;
 
-  // Intel generasi umum
-  if (/i5-12400|i5 12400/.test(n)) return 65;
-  if (/i7-12700k|i9-12900k/.test(n)) return 125;
+  // Intel common
+  if (/i5[-\s]?12400/.test(n)) return 65;
 
-  // fallback default CPU mid range
+  // Intel K-series typical (TDP base), peak will be handled later
+  if (isIntelK(name)) return 125;
+
+  // fallback typical
   return 95;
 }
 
@@ -190,28 +209,49 @@ function estimatePower(items) {
   const gpu = items.find((i) => i.category === "GPU");
   const psu = items.find((i) => i.category === "PSU");
 
-  const cpuWatt = cpu ? detectCpuWatt(cpu.name) : 0;
-  const gpuWatt = gpu ? detectGpuWatt(gpu.name) : 0;
+  const cpuTypical = cpu ? detectCpuWatt(cpu.name) : 0;
+  const gpuTypical = gpu ? detectGpuWatt(gpu.name) : 0;
 
-  const overhead = 90; // asumsi komponen lain
+  // overhead typical vs peak (fans, drives, rgb, usb devices)
+  const overheadTypical = 80;
+  const overheadPeak = 110;
 
-  const rawTotal = cpuWatt + gpuWatt + overhead;
+  const typicalLoad = cpuTypical + gpuTypical + overheadTypical;
 
-  const recommendedRaw = rawTotal * 1.5;
+  // Peak heuristics (tanpa DB):
+  let cpuPeak = cpuTypical;
+  if (cpu) {
+    if (isRyzen(cpu.name)) cpuPeak = Math.round(cpuTypical * 1.25);
+    else if (isIntelK(cpu.name)) cpuPeak = Math.round(cpuTypical * 1.6);
+    else cpuPeak = Math.round(cpuTypical * 1.3);
+  }
+
+  let gpuPeak = gpuTypical ? Math.round(gpuTypical * 1.2) : 0;
+
+  const peakLoad = cpuPeak + gpuPeak + overheadPeak;
+
+  // rekomendasi PSU pakai peak + headroom kecil
+  const recommendedRaw = peakLoad * 1.25;
   const recommendedPsu = roundToPsuStandard(recommendedRaw);
 
   // Detect watt PSU dari nama jika ada angka seperti 550W
   let selectedPsuWatt = 0;
   if (psu) {
     const match = psu.name.match(/(\d{3,4})\s*w/i);
-    if (match) selectedPsuWatt = parseInt(match[1]);
+    if (match) selectedPsuWatt = parseInt(match[1], 10);
   }
 
   return {
-    cpuWatt,
-    gpuWatt,
-    overhead,
-    rawTotal,
+    cpuTypical,
+    gpuTypical,
+    overheadTypical,
+    typicalLoad,
+
+    cpuPeak,
+    gpuPeak,
+    overheadPeak,
+    peakLoad,
+
     recommendedPsu,
     selectedPsuWatt,
   };
@@ -227,15 +267,34 @@ function estimatePower(items) {
 function detectCpuSocket(name) {
   const n = name.toLowerCase();
 
-  // AMD
-  if (/ryzen/.test(n)) return "AM4";
-  if (/am5/.test(n)) return "AM5";
+  // ===== AMD Ryzen =====
+  if (n.includes("ryzen")) {
 
-  // Intel generasi 12+
-  if (/12\d{2}|13\d{2}|14\d{2}/.test(n)) return "LGA1700";
+    // AM5 series (7000 / 8000)
+    if (/7\d{3}|8\d{3}/.test(n)) {
+      return "AM5";
+    }
 
-  // Intel lama
-  if (/10\d{2}|11\d{2}/.test(n)) return "LGA1200";
+    // AM4 series (1000–5000)
+    if (/1\d{3}|2\d{3}|3\d{3}|4\d{3}|5\d{3}/.test(n)) {
+      return "AM4";
+    }
+
+    // fallback lama
+    return "AM4";
+  }
+
+  // ===== Intel =====
+
+  // 12th / 13th / 14th gen
+  if (/12\d{2}|13\d{2}|14\d{2}/.test(n)) {
+    return "LGA1700";
+  }
+
+  // 10th / 11th gen
+  if (/10\d{2}|11\d{2}/.test(n)) {
+    return "LGA1200";
+  }
 
   return null;
 }
@@ -365,6 +424,9 @@ export default function App() {
   const nameInputRef = useRef(null);
   const activeBuild = builds.byId[builds.activeId];
   const [compareId, setCompareId] = useState("");
+  const [showEmptyCats, setShowEmptyCats] = useState(false);
+  const [search, setSearch] = useState("");
+  const searchRef = useRef(null);
 
   // form input
   const [category, setCategory] = useState("CPU");
@@ -539,6 +601,22 @@ export default function App() {
     setPriceInput("");
     setUrl("");
     setNote("");
+
+    nameInputRef.current?.focus();
+  }
+
+  // function onEnterAdd(e) {
+  //   if (e.key !== "Enter") return;
+  //   // kalau user pakai IME (Jepang/China), hindari enter saat composing
+  //   if (e.isComposing) return;
+  //   e.preventDefault();
+  //   addItem();
+  // }
+  function onEnterAdd(e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      addItem();
+    }
   }
 
   function calcTotal(items) {
@@ -708,202 +786,339 @@ export default function App() {
     alert("Share link copied!");
   }
 
+  const searchKey = search.trim().toLowerCase();
+
+  function matchesSearch(it) {
+    if (!searchKey) return true;
+    return (
+      it.name?.toLowerCase().includes(searchKey) ||
+      it.url?.toLowerCase().includes(searchKey) ||
+      it.note?.toLowerCase().includes(searchKey)
+    );
+  }
+
+  function escapeRegExp(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function HighlightText({ text, query }) {
+    const q = (query || "").trim();
+    if (!q) return <>{text}</>;
+
+    const re = new RegExp(`(${escapeRegExp(q)})`, "ig");
+    const parts = String(text).split(re);
+
+    return (
+      <>
+        {parts.map((p, i) =>
+          re.test(p) ? (
+            <mark key={i} className="hl">{p}</mark>
+          ) : (
+            <span key={i}>{p}</span>
+          )
+        )}
+      </>
+    );
+  }
+
   // UI simpel tapi rapi
   return (
     <div className="container">
-      <h1 style={{ marginTop: 0 }}>PC Build Simulator</h1>
+      <h1>PC Build Simulator</h1>
 
-      {/* Build selector */}
-      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-        <b>Build:</b>
-        <select
-          className="select"
-          value={builds.activeId}
-          onChange={(e) => setBuilds((p) => ({ ...p, activeId: e.target.value }))}
-        >
-          {buildOptions.map((b) => (
-            <option key={b.id} value={b.id}>
-              {b.name}
-            </option>
-          ))}
-        </select>
+      {/* build selector*/}
+      <div className="card">
+        <div className="actions" style={{ alignItems: "center" }}>
+          <span className="badge">Build</span>
 
-        <button className="btn" onClick={createBuild}>+ New</button>
-        <button className="btn" onClick={duplicateBuild}>Duplicate</button>
-        <button className="btn" onClick={renameBuild}>Rename</button>
-        <button className="btn" onClick={deleteBuild}>Delete</button>
+          <select
+            className="select"
+            value={builds.activeId}
+            onChange={(e) => setBuilds((p) => ({ ...p, activeId: e.target.value }))}
+            style={{ maxWidth: 260 }}
+          >
+            {buildOptions.map((b) => (
+              <option key={b.id} value={b.id}>
+                {b.name}
+              </option>
+            ))}
+          </select>
+
+          <button className="btn" onClick={createBuild}>+ New</button>
+          <button className="btn" onClick={duplicateBuild}>Duplicate</button>
+          <button className="btn" onClick={renameBuild}>Rename</button>
+          <button className="btn btnDanger" onClick={deleteBuild}>Delete</button>
+        </div>
+
+        <hr className="hr" />
+
+        {/* Budget */}
+        <div className="actions" style={{ alignItems: "center" }}>
+          <span className="badge">Budget</span>
+          <input
+            className="input"
+            value={activeBuild.budget ? String(activeBuild.budget) : ""}
+            onChange={(e) => {
+              const v = e.target.value.replace(/[^\d]/g, "");
+              setActiveBudget(v ? Number(v) : 0);
+            }}
+            placeholder="Contoh: 8500000"
+            inputMode="numeric"
+            style={{ maxWidth: 220 }}
+          />
+          <span className="muted">
+            {activeBuild.budget ? `Rp ${formatRp(activeBuild.budget)}` : "Belum diset"}
+          </span>
+        </div>
       </div>
 
-      <hr style={{ opacity: 0.2, margin: "14px 0" }} />
-      {/* Budget */}
-      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-        <b>Budget (IDR):</b>
-        <input
-          className="input"
-          value={activeBuild.budget ? String(activeBuild.budget) : ""}
-          onChange={(e) => {
-            const v = e.target.value.replace(/[^\d]/g, "");
-            setActiveBudget(v ? Number(v) : 0);
-          }}
-          placeholder="Contoh: 8500000"
-          inputMode="numeric"
-          style={{ padding: 10, width: 200 }}
-        />
-        <span style={{ opacity: 0.75 }}>
-          {activeBuild.budget ? `Rp ${formatRp(activeBuild.budget)}` : "Belum diset"}
-        </span>
+      <div className="summaryStrip">
+        <div className="summaryChip primary">
+          <span className="summaryLabel">Total</span>
+          <span className="summaryValue">Rp {formatRp(total)}</span>
+        </div>
+
+        <div className="summaryChip">
+          <span className="summaryLabel">Budget</span>
+          <span className={`summaryValue ${activeBuild.budget > 0 && total > activeBuild.budget ? "bad" : "ok"}`}>
+            {activeBuild.budget > 0 ? `Rp ${formatRp(activeBuild.budget)}` : "Belum set"}
+          </span>
+        </div>
+
+        <div className="summaryChip">
+          <span className="summaryLabel">PSU Rec</span>
+          <span className="summaryValue">{power.recommendedPsu}W</span>
+        </div>
+
+        <div className="summaryChip">
+          <span className="summaryLabel">PSU</span>
+          <span className={`summaryValue ${power.selectedPsuWatt > 0 && power.selectedPsuWatt < power.recommendedPsu ? "bad" : "ok"}`}>
+            {power.selectedPsuWatt > 0 ? `${power.selectedPsuWatt}W` : "Not Set"}
+          </span>
+        </div>
+
+        <div className="summaryChip">
+          <span className="summaryLabel">CPU/GPU Est</span>
+          <span className="summaryValue">{power.cpuWatt}W / {power.gpuWatt}W</span>
+        </div>
       </div>
 
       {/* Input */}
-      <div style={{ display: "grid", gridTemplateColumns: "160px 1fr 180px 1fr", gap: 10 }}>
-        <div>
-          <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Kategori</div>
-          <select className="select" value={category} onChange={(e) => setCategory(e.target.value)} style={{ width: "100%", padding: 10 }}>
-            {CATEGORIES.map((c) => (
-              <option key={c} value={c}>{c}</option>
-            ))}
-          </select>
-        </div>
+      <div className="card" style={{ marginTop: 16 }}>
+        <h3>Add Item</h3>
 
-        <div>
-          <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Nama Produk</div>
-          <input
-            ref={nameInputRef}
-            className="input"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Contoh: ADATA LEGEND 710 1TB"
-            style={{ width: "100%", padding: 10 }}
-          />
-        </div>
+        <div className="row">
+          <div>
+            <div className="label">Kategori</div>
+            <select
+              className="select"
+              value={category}
+              onChange={(e) => setCategory(e.target.value)}
+            >
+              {CATEGORIES.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </div>
 
-        <div>
-          <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Harga (IDR)</div>
-          <input
-            className="input"
-            value={priceInput}
-            onChange={(e) => setPriceInput(e.target.value)}
-            placeholder="Contoh: 1.279.000"
-            inputMode="numeric"
-            style={{ width: "100%", padding: 10 }}
-          />
-          <div style={{ fontSize: 12, opacity: 0.75, marginTop: 6 }}>
-            Preview: <b>Rp {formatRp(parsePriceToInt(priceInput))}</b>
+          <div>
+            <div className="label">Nama Produk</div>
+            <input
+              ref={nameInputRef}
+              className="input"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={onEnterAdd}
+              placeholder="Contoh: ADATA LEGEND 710 1TB"
+            />
+          </div>
+
+          <div>
+            <div className="label">Harga (IDR)</div>
+            <input
+              className="input"
+              value={priceInput}
+              onChange={(e) => setPriceInput(formatPriceInput(e.target.value))}
+              onKeyDown={onEnterAdd}
+              placeholder="Contoh: 1.279.000"
+              inputMode="numeric"
+            />
+            <div className="muted" style={{ marginTop: 6 }}>
+              Preview: <b>Rp {formatRp(parsePriceToInt(priceInput))}</b>
+            </div>
+          </div>
+
+          <div>
+            <div className="label">Link (opsional)</div>
+            <input
+              className="input"
+              value={url}
+              onChange={(e) => {
+                const v = e.target.value;
+                setUrl(v);
+                if (!name.trim()) {
+                  const g = guessNameFromUrl(v);
+                  if (g) setName(g);
+                }
+              }}
+              onKeyDown={onEnterAdd}
+              placeholder="https://www.tokopedia.com/..."
+            />
+            <div className="actions" style={{ marginTop: 8 }}>
+              <button className="btn" onClick={autoFillNameFromLink} type="button">
+                Tebak Nama dari Link
+              </button>
+            </div>
+          </div>
+
+          <div style={{ gridColumn: "1 / -1" }}>
+            <div className="label">Catatan (opsional)</div>
+            <input
+              className="input"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="Contoh: garansi 3 tahun, seller official, dll"
+              onKeyDown={onEnterAdd}
+            />
           </div>
         </div>
 
-        <div>
-          <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Link (opsional)</div>
-          <input
-            className="input"
-            value={url}
-            onChange={(e) => {
-              const v = e.target.value;
-              setUrl(v);
-              if (!name.trim()) {
-                const g = guessNameFromUrl(v);
-                if (g) setName(g);
-              }
+        <div className="actions" style={{ marginTop: 12 }}>
+          <button className="btn" onClick={addItem}>+ Tambah</button>
+          <button className="btn" onClick={copyShare} disabled={!activeBuild.items.length}>Copy WA</button>
+          <button className="btn" onClick={exportCsv} disabled={!activeBuild.items.length}>Export CSV</button>
+          <button className="btn" onClick={generateShareLink}>Generate Share Link</button>
+          <button className="btn btnDanger" onClick={clearBuild} disabled={!activeBuild.items.length}>Clear Build</button>
+        </div>
+
+        <div className="muted" style={{ marginTop: 10 }}>
+          Saved otomatis di browser (localStorage). Kamu bisa bikin banyak build.
+        </div>
+      </div>
+
+      {/*Input Search */}
+      <div style={{ marginTop: 12, position: "relative" }}>
+        <input
+          ref={searchRef}
+          className="input"
+          placeholder="Search item (nama / link / note)..."
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              setSearch("");
+              // balikin fokus biar enak
+              setTimeout(() => searchRef.current?.focus(), 0);
+            }
+          }}
+          style={{ paddingRight: 40 }}
+        />
+
+        {search.trim() && (
+          <button
+            type="button"
+            className="iconBtn"
+            onClick={() => {
+              setSearch("");
+              setTimeout(() => searchRef.current?.focus(), 0);
             }}
-            placeholder="https://www.tokopedia.com/..."
-            style={{ width: "100%", padding: 10 }}
-          />
-          <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
-            <button onClick={autoFillNameFromLink} type="button">Tebak Nama dari Link</button>
-          </div>
+            aria-label="Clear search"
+            title="Clear (Esc)"
+          >
+            ✕
+          </button>
+        )}
+      </div>
+
+      <div className="actions toggleRow">
+        <div className="muted">
+          Categories
         </div>
 
-        <div style={{ gridColumn: "1 / -1" }}>
-          <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Catatan (opsional)</div>
+        <label className="toggle muted" style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <input
-            className="input"
-            value={note}
-            onChange={(e) => setNote(e.target.value)}
-            placeholder="Contoh: garansi 3 tahun, seller official, dll"
-            style={{ width: "100%", padding: 10 }}
+            type="checkbox"
+            checked={showEmptyCats}
+            disabled={!!searchKey}
+            onChange={(e) => setShowEmptyCats(e.target.checked)}
           />
-        </div>
+          Show empty categories
+        </label>
       </div>
-
-      <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
-        <button className="btn" onClick={addItem}>+ Tambah</button>
-        <button className="btn" onClick={copyShare} disabled={!activeBuild.items.length}>Copy WA</button>
-        <button className="btn" onClick={exportCsv} disabled={!activeBuild.items.length}>Export CSV</button>
-        <button className="btn" onClick={generateShareLink}>
-          Generate Share Link
-        </button>
-        <button className="btn" onClick={clearBuild} disabled={!activeBuild.items.length}>Clear Build</button>
-      </div>
-
-      <hr style={{ opacity: 0.2, margin: "14px 0" }} />
-
       {/* List per kategori */}
-      {CATEGORIES.map((cat) => {
-        const catItems = activeBuild.items.filter((x) => x.category === cat);
-        return (
-          <div key={cat} style={{ marginBottom: 14 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+      {CATEGORIES
+        .filter((cat) => {
+          // kalau user centang "Show empty", tampilkan semua kategori
+          if (showEmptyCats && !searchKey) return true;
+
+          // kalau tidak, tampilkan kategori hanya kalau ada item yang match search
+          return activeBuild.items.some((it) => it.category === cat && matchesSearch(it));
+        })
+        .map((cat) => {
+          const catItems = activeBuild.items
+            .filter((it) => it.category === cat)
+            .filter(matchesSearch);
+
+          return (
+            <div key={cat} style={{ marginBottom: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                 <h3 style={{ margin: 0 }}>{cat}</h3>
+                <button className="btn" onClick={() => quickPickCategory(cat)}>+ Add</button>
                 <span className="badge">{catItems.length} item</span>
               </div>
-              <button className="btn" onClick={() => quickPickCategory(cat)}>+ Add</button>
+
+              {catItems.length === 0 ? (
+                <div style={{ opacity: 0.5, padding: "6px 0" }}>Empty</div>
+              ) : (
+                <div className="gridList">
+                  {catItems.map((it) => (
+                    <div key={it.id} className="itemCard">
+                      <div style={{ minWidth: 0 }}>
+                        <b style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          <HighlightText text={it.name} query={search} />
+                        </b>
+                        {it.note ? <div className="muted"><HighlightText text={it.note} query={search} /></div> : null}
+                        {it.url ? (
+                          <div className="muted" style={{ marginTop: 4 }}>
+                            <a href={it.url} target="_blank" rel="noreferrer">
+                              <HighlightText text={it.url} query={search} />
+                            </a>
+                          </div>
+                        ) : null}
+                      </div>
+
+                      <div style={{ textAlign: "right", whiteSpace: "nowrap" }}>
+                        <div><b>Rp {formatRp(it.price)}</b></div>
+                        <button className="btn btnDanger" onClick={() => removeItem(it.id)} style={{ marginTop: 6 }}>
+                          Hapus
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
-
-            {catItems.length === 0 ? (
-              <div style={{ opacity: 0.5, padding: "6px 0" }}>Empty</div>
-            ) : (
-              <div style={{ display: "grid", gap: 8, marginTop: 8 }}>
-                {catItems.map((it) => (
-                  <div
-                    key={it.id}
-                    className="itemCard"
-                  >
-                    <div style={{ minWidth: 0 }}>
-                      <b style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {it.name}
-                      </b>
-                      {it.note ? <div className="muted">{it.note}</div> : null}
-                      {it.url ? (
-                        <div className="muted" style={{ marginTop: 4 }}>
-                          <a href={it.url} target="_blank" rel="noreferrer">{it.url}</a>
-                        </div>
-                      ) : null}
-                    </div>
-
-                    <div style={{ textAlign: "right", whiteSpace: "nowrap" }}>
-                      <div><b>Rp {formatRp(it.price)}</b></div>
-                      <button className="btn btnDanger" onClick={() => removeItem(it.id)} style={{ marginTop: 6 }}>
-                        Hapus
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        );
-      })}
+          );
+        })}
 
       <hr style={{ opacity: 0.2, margin: "14px 0" }} />
 
       <div className="sectionGrid">
         {/* POWER */}
         <div className="card">
-          <h3>Power Estimate</h3>
-
-          <div>CPU Estimate: {power.cpuWatt}W</div>
-          <div>GPU Estimate: {power.gpuWatt}W</div>
-          <div>Other Components (Overhead): {power.overhead}W</div>
+          <div>CPU Typical: {power.cpuTypical}W</div>
+          <div>GPU Typical: {power.gpuTypical}W</div>
+          <div>Typical Load: <b>{power.typicalLoad}W</b></div>
 
           <hr className="hr" />
 
-          <div>
-            <b>Estimated Load: {power.rawTotal}W</b>
-          </div>
-          <div>
-            <b>Recommended PSU: {power.recommendedPsu}W</b>
-          </div>
+          <div>CPU Peak: {power.cpuPeak}W</div>
+          <div>GPU Peak: {power.gpuPeak}W</div>
+          <div>Peak Load: <b>{power.peakLoad}W</b></div>
+
+          <hr className="hr" />
+
+          <div><b>Recommended PSU: {power.recommendedPsu}W</b></div>
 
           {power.selectedPsuWatt > 0 && (
             <div
@@ -1131,21 +1346,17 @@ export default function App() {
       )}
 
       {/* Sticky Bottom Summary */}
-      <div
-        className="sticky"
-      >
-        <div>
-          <b>Total:</b> Rp {formatRp(total)}
-        </div>
+      <div className="sticky">
+        <div><b>Total:</b> Rp {formatRp(total)}</div>
 
         <div>
           {activeBuild.budget > 0 && (
             <>
               <b>Budget:</b> Rp {formatRp(activeBuild.budget)}{" "}
               {total > activeBuild.budget ? (
-                <span style={{ color: "red" }}>⚠ Over</span>
+                <span style={{ color: "var(--bad)" }}>⚠ Over</span>
               ) : (
-                <span style={{ color: "lightgreen" }}>✓ OK</span>
+                <span style={{ color: "var(--ok)" }}>✓ OK</span>
               )}
             </>
           )}
@@ -1156,9 +1367,9 @@ export default function App() {
             <>
               <b>PSU:</b>{" "}
               {power.selectedPsuWatt < power.recommendedPsu ? (
-                <span style={{ color: "red" }}>Kurang</span>
+                <span style={{ color: "var(--bad)" }}>Kurang</span>
               ) : (
-                <span style={{ color: "lightgreen" }}>Aman</span>
+                <span style={{ color: "var(--ok)" }}>Aman</span>
               )}
             </>
           )}
