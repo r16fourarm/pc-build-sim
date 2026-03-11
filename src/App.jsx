@@ -196,6 +196,28 @@ function detectGpuWatt(name) {
   return 200;
 }
 
+function detectPsuWatt(name) {
+  const n = name.toLowerCase();
+
+  // pola paling aman: 550w / 650 w / 750 watt
+  let match = n.match(/(\d{3,4})\s*(w|watt)\b/i);
+  if (match) return parseInt(match[1], 10);
+
+  // pola umum PSU model:
+  // rm650x / gx-750 / a750gl / mwe650 / cv550 / cx650m
+  match = n.match(/\b([a-z]*)(\d{3,4})([a-z]*)\b/i);
+  if (match) {
+    const watt = parseInt(match[2], 10);
+
+    // batasi hanya angka watt yang masuk akal untuk PSU
+    if (watt >= 400 && watt <= 1600) {
+      return watt;
+    }
+  }
+
+  return 0;
+}
+
 /*
   Main estimator function
   Menghitung:
@@ -237,8 +259,7 @@ function estimatePower(items) {
   // Detect watt PSU dari nama jika ada angka seperti 550W
   let selectedPsuWatt = 0;
   if (psu) {
-    const match = psu.name.match(/(\d{3,4})\s*w/i);
-    if (match) selectedPsuWatt = parseInt(match[1], 10);
+    selectedPsuWatt = detectPsuWatt(psu.name);
   }
 
   return {
@@ -335,6 +356,33 @@ function checkCpuMoboCompatibility(items) {
   };
 }
 
+/* cek kelengkapan part build */
+
+function checkBuildCompleteness(items) {
+  const has = (cat) => items.some((i) => i.category === cat);
+
+  const warnings = [];
+
+  if (!has("CPU")) warnings.push("CPU belum ditambahkan");
+  if (!has("Motherboard")) warnings.push("Motherboard belum ditambahkan");
+  if (!has("RAM")) warnings.push("RAM belum ditambahkan");
+  if (!has("PSU")) warnings.push("PSU belum ditambahkan");
+
+  // storage check (SSD atau Other bisa dianggap storage kalau mau)
+  const hasStorage = items.some((i) =>
+    i.category === "SSD" || /ssd|nvme|hdd/i.test(i.name)
+  );
+
+  if (!hasStorage) warnings.push("Belum ada storage (SSD/HDD)");
+
+  // GPU tanpa PSU warning tambahan
+  if (has("GPU") && !has("PSU")) {
+    warnings.push("GPU ada tapi PSU belum ditambahkan");
+  }
+
+  return warnings;
+}
+
 /* ===============================
    DDR (RAM) COMPATIBILITY SECTION
    =============================== */
@@ -344,6 +392,43 @@ function detectRamDdr(name) {
   if (n.includes("ddr5")) return "DDR5";
   if (n.includes("ddr4")) return "DDR4";
   return null;
+}
+
+function detectRamCapacity(name) {
+  const n = name.toLowerCase();
+
+  // pola 2x8gb / 2 x 16gb
+  let match = n.match(/(\d+)\s*x\s*(\d+)\s*gb/);
+  if (match) {
+    const sticks = parseInt(match[1], 10);
+    const size = parseInt(match[2], 10);
+    return sticks * size;
+  }
+
+  // pola 16gb / 32 gb
+  match = n.match(/(\d+)\s*gb/);
+  if (match) {
+    return parseInt(match[1], 10);
+  }
+
+  return 0;
+}
+
+function detectRamKit(name) {
+  const n = name.toLowerCase();
+
+  const match = n.match(/(\d+)\s*x\s*(\d+)\s*gb/);
+
+  if (match) {
+    const sticks = parseInt(match[1], 10);
+
+    if (sticks === 2) return "Dual Channel Kit";
+    if (sticks === 4) return "Quad Kit";
+
+    return `${sticks} Stick Kit`;
+  }
+
+  return "Single Stick";
 }
 
 function detectMoboDdr(name) {
@@ -370,6 +455,8 @@ function detectMoboDdr(name) {
   return null;
 }
 
+
+
 function checkRamMoboDdr(items) {
   const ram = items.find((i) => i.category === "RAM");
   const mobo = items.find((i) => i.category === "Motherboard");
@@ -385,6 +472,124 @@ function checkRamMoboDdr(items) {
 
   return { ramDdr, moboDdr, compatible: ramDdr === moboDdr };
 }
+
+
+// status: "ok" | "warn" | "error" | "unknown"
+function triStateFromBool(b) {
+  if (b === true) return "ok";
+  if (b === false) return "error";
+  return "unknown"; // null / undefined
+}
+
+
+
+function analyzeBuild(items, budget = 0) {
+  const total = items.reduce((s, it) => s + (it.price || 0), 0);
+
+  const power = estimatePower(items); // kamu sudah punya
+  const cpuMobo = checkCpuMoboCompatibility(items); // null or {..}
+  const ddr = checkRamMoboDdr(items); // null or {..}
+
+  const ram = items.find((i) => i.category === "RAM");
+
+  let ramCapacity = 0;
+  let ramKit = null;
+
+  if (ram) {
+    ramCapacity = detectRamCapacity(ram.name);
+    ramKit = detectRamKit(ram.name);
+  }
+
+  // Missing essentials (customize sesukamu)
+  const missing = [];
+  const has = (cat) => items.some((i) => i.category === cat);
+
+  if (!has("CPU")) missing.push({ level: "warn", cat: "CPU", msg: "CPU belum ditambahkan" });
+  if (!has("Motherboard")) missing.push({ level: "warn", cat: "Motherboard belum ditambahkan" });
+  if (!has("RAM")) missing.push({ level: "warn", cat: "RAM belum ditambahkan" });
+  if (!has("SSD")) missing.push({ level: "info", cat: "SSD", msg: "SSD belum ditambahkan" });
+  if (!has("PSU")) missing.push({ level: "warn", cat: "PSU", msg: "PSU belum ditambahkan" });
+
+  // Compatibility results
+  const issues = [];
+
+  // CPU↔Mobo (socket)
+  if (cpuMobo) {
+    const st = triStateFromBool(cpuMobo.compatible);
+    if (st === "error") {
+      issues.push({
+        level: "error",
+        cats: ["CPU", "Motherboard"],
+        msg: `Socket tidak cocok: CPU ${cpuMobo.cpuSocket} vs Mobo ${cpuMobo.moboSocket}`,
+      });
+    }
+  } else {
+    issues.push({
+      level: "info",
+      cats: ["CPU", "Motherboard"],
+      msg: "Tambahkan CPU + Motherboard untuk cek socket",
+    });
+  }
+
+  // DDR
+  if (ddr) {
+    const st = triStateFromBool(ddr.compatible);
+    if (st === "error") {
+      issues.push({
+        level: "error",
+        cats: ["RAM", "Motherboard"],
+        msg: `DDR tidak cocok: RAM ${ddr.ramDdr || "Unknown"} vs Mobo ${ddr.moboDdr || "Unknown"}`,
+      });
+    } else if (st === "unknown") {
+      issues.push({
+        level: "info",
+        cats: ["RAM", "Motherboard"],
+        msg: "DDR belum bisa dipastikan (nama RAM/Mobo tidak mencantumkan DDR4/DDR5)",
+      });
+    }
+  } else {
+    issues.push({
+      level: "info",
+      cats: ["RAM", "Motherboard"],
+      msg: "Tambahkan RAM + Motherboard untuk cek DDR",
+    });
+  }
+
+  // Budget status
+  const budgetInfo =
+    budget > 0
+      ? {
+        over: total > budget,
+        diff: budget - total,
+        pct: Math.min(100, Math.round((total / budget) * 100)),
+      }
+      : null;
+
+  // Helper: kategori yang “bermasalah”
+  const catFlags = {}; // { CPU: "error"/"warn"/"info" ... }
+  const applyFlag = (cat, level) => {
+    const prio = { error: 3, warn: 2, info: 1, ok: 0 };
+    const prev = catFlags[cat] || "ok";
+    if (prio[level] > prio[prev]) catFlags[cat] = level;
+  };
+
+  for (const m of missing) applyFlag(m.cat, m.level);
+  for (const it of issues) for (const c of it.cats) applyFlag(c, it.level);
+
+  return {
+    total,
+    power,
+    cpuMobo,
+    ddr,
+    ramCapacity,
+    ramKit,
+    missing,
+    issues,
+    budgetInfo,
+    catFlags,
+  };
+}
+
 
 function buildCsv(items) {
   // CSV sederhana: category,name,price,url,note
@@ -538,21 +743,58 @@ export default function App() {
     }
   }, [builds]);
 
-  const total = useMemo(() => {
-    return activeBuild.items.reduce((s, it) => s + (it.price || 0), 0);
+  // const total = useMemo(() => {
+  //   return activeBuild.items.reduce((s, it) => s + (it.price || 0), 0);
+  // }, [activeBuild.items]);
+
+  // const power = useMemo(() => {
+  //   return estimatePower(activeBuild.items);
+  // }, [activeBuild.items]);
+
+  // const compatibility = useMemo(() => {
+  //   return checkCpuMoboCompatibility(activeBuild.items);
+  // }, [activeBuild.items]);
+
+  // const ddrCheck = useMemo(() => {
+  //   return checkRamMoboDdr(activeBuild.items);
+  // }, [activeBuild.items]);
+
+  const analysis = useMemo(() => {
+    return analyzeBuild(activeBuild.items, activeBuild.budget);
+  }, [activeBuild.items, activeBuild.budget]);
+
+  // biar minim perubahan UI existing kamu:
+  const total = analysis.total;
+  const power = analysis.power;
+  const compatibility = analysis.cpuMobo;
+  const ddrCheck = analysis.ddr;
+
+  const completenessWarnings = useMemo(() => {
+    return checkBuildCompleteness(activeBuild.items);
   }, [activeBuild.items]);
 
-  const power = useMemo(() => {
-    return estimatePower(activeBuild.items);
-  }, [activeBuild.items]);
+  const hardCompatibility = useMemo(() => {
+    const errors = [];
 
-  const compatibility = useMemo(() => {
-    return checkCpuMoboCompatibility(activeBuild.items);
-  }, [activeBuild.items]);
+    if (compatibility && compatibility.compatible === false) {
+      errors.push("CPU dan Motherboard tidak kompatibel (Socket berbeda)");
+    }
 
-  const ddrCheck = useMemo(() => {
-    return checkRamMoboDdr(activeBuild.items);
-  }, [activeBuild.items]);
+    if (ddrCheck && ddrCheck.compatible === false) {
+      errors.push("RAM dan Motherboard tidak kompatibel (DDR berbeda)");
+    }
+
+    return errors;
+  }, [compatibility, ddrCheck]);
+
+  function shouldConfirmAdd(nextItems) {
+    const next = analyzeBuild(nextItems, activeBuild.budget);
+    const hardErrors = next.issues.filter((x) => x.level === "error");
+    if (!hardErrors.length) return null;
+
+    const msg = hardErrors.map((e) => `- ${e.msg}`).join("\n");
+    return `⚠ Ada incompatibility:\n${msg}\n\nTetap tambahkan?`;
+  }
 
   function addItem() {
     const trimmedName = name.trim();
@@ -579,6 +821,54 @@ export default function App() {
       "Case",
       "Monitor",
     ]);
+
+    // sebelum setBuilds(...)
+    const currentItems = activeBuild.items;
+
+    // cek socket mismatch jika add CPU/Mobo
+    if (category === "CPU" || category === "Motherboard") {
+      const tempItems = [
+        // simulasi: item baru + items lama (tapi replace single category)
+        item,
+        ...currentItems.filter((x) => x.category !== category),
+      ];
+
+      const comp = checkCpuMoboCompatibility(tempItems);
+
+      if (comp && comp.compatible === false) {
+        const ok = confirm(
+          `⚠ Tidak kompatibel!\nCPU Socket: ${comp.cpuSocket}\nMobo Socket: ${comp.moboSocket}\n\nTetap tambahkan?`
+        );
+        if (!ok) return;
+      }
+    }
+
+    // cek DDR mismatch jika add RAM atau Motherboard
+    if (category === "RAM" || category === "Motherboard") {
+      const tempItems = [
+        item,
+        ...currentItems.filter((x) => x.category !== category),
+      ];
+
+      const ddr = checkRamMoboDdr(tempItems);
+
+      if (ddr && ddr.compatible === false) {
+        const ok = confirm(
+          `⚠ DDR tidak cocok!\nRAM: ${ddr.ramDdr}\nMobo: ${ddr.moboDdr}\n\nTetap tambahkan?`
+        );
+        if (!ok) return;
+      }
+    }
+
+    const nextItems = SINGLE_CATEGORIES.has(category)
+      ? [item, ...activeBuild.items.filter((x) => x.category !== category)]
+      : [item, ...activeBuild.items];
+
+    const confirmMsg = shouldConfirmAdd(nextItems);
+    if (confirmMsg) {
+      const ok = confirm(confirmMsg);
+      if (!ok) return;
+    }
 
     setBuilds((prev) => {
       const b = prev.byId[prev.activeId];
@@ -1061,10 +1351,27 @@ export default function App() {
 
           return (
             <div key={cat} style={{ marginBottom: 14 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                <h3 style={{ margin: 0 }}>{cat}</h3>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <h3 style={{ margin: 0 }}>{cat}</h3>
+                  <span className="badge">{catItems.length} item</span>
+                  {analysis.catFlags[cat] === "error" && (
+                    <span className="badge" style={{ color: "var(--bad)", borderColor: "var(--bad)" }}>
+                      Error
+                    </span>
+                  )}
+                  {analysis.catFlags[cat] === "warn" && (
+                    <span className="badge" style={{ color: "#ffd166", borderColor: "#ffd166" }}>
+                      Warn
+                    </span>
+                  )}
+                  {analysis.catFlags[cat] === "info" && (
+                    <span className="badge">
+                      Info
+                    </span>
+                  )}
+                </div>
                 <button className="btn" onClick={() => quickPickCategory(cat)}>+ Add</button>
-                <span className="badge">{catItems.length} item</span>
               </div>
 
               {catItems.length === 0 ? (
@@ -1102,6 +1409,73 @@ export default function App() {
         })}
 
       <hr style={{ opacity: 0.2, margin: "14px 0" }} />
+
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <h3>Build Status</h3>
+
+        {analysis.issues.length === 0 && analysis.missing.length === 0 ? (
+          <div className="ok" style={{ fontWeight: "bold" }}>
+            ✓ Build terlihat lengkap dan tidak ada incompatibility utama.
+          </div>
+        ) : (
+          <div style={{ display: "grid", gap: 8 }}>
+            {analysis.issues.map((issue, i) => (
+              <div
+                key={`issue-${i}`}
+                style={{
+                  color:
+                    issue.level === "error"
+                      ? "var(--bad)"
+                      : issue.level === "warn"
+                        ? "#ffd166"
+                        : "var(--muted)",
+                  fontWeight: issue.level === "error" ? "bold" : "normal",
+                }}
+              >
+                {issue.level === "error" ? "❌" : issue.level === "warn" ? "⚠" : "ℹ"} {issue.msg}
+              </div>
+            ))}
+
+            {analysis.missing.map((m, i) => (
+              <div
+                key={`missing-${i}`}
+                style={{
+                  color:
+                    m.level === "error"
+                      ? "var(--bad)"
+                      : m.level === "warn"
+                        ? "#ffd166"
+                        : "var(--muted)",
+                }}
+              >
+                {m.level === "error" ? "❌" : m.level === "warn" ? "⚠" : "ℹ"} {m.msg}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Hard Compatibility */}
+      {hardCompatibility.length > 0 && (
+        <div className="card" style={{
+          borderColor: "rgba(255,0,0,.6)",
+          background: "rgba(58,21,32,.4)"
+        }}>
+          <h3 style={{ color: "var(--bad)" }}>Build Tidak Kompatibel</h3>
+
+          <div style={{ display: "grid", gap: 6, marginTop: 10 }}>
+            {hardCompatibility.map((err, i) => (
+              <div key={i} style={{ fontWeight: "bold", color: "var(--bad)" }}>
+                ❌ {err}
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 8, opacity: .75 }}>
+            Perbaiki komponen di atas sebelum melanjutkan build.
+          </div>
+        </div>
+      )}
 
       <div className="sectionGrid">
         {/* POWER */}
@@ -1162,6 +1536,18 @@ export default function App() {
             </>
           )}
         </div>
+          {/*Ram info */}
+        {analysis.ramCapacity > 0 && (
+          <div className="card">
+            <h3>RAM Info</h3>
+
+            <div>Total RAM: <b>{analysis.ramCapacity} GB</b></div>
+
+            {analysis.ramKit && (
+              <div>Kit Type: {analysis.ramKit}</div>
+            )}
+          </div>
+        )}
 
         {/* DDR */}
         <div className="card">
@@ -1199,6 +1585,20 @@ export default function App() {
         </div>
       </div>
 
+      {completenessWarnings.length > 0 && (
+        <div className="card" style={{ borderColor: "rgba(255,107,107,.5)" }}>
+          <h3>Build Status</h3>
+
+          <div style={{ display: "grid", gap: 6, marginTop: 10 }}>
+            {completenessWarnings.map((w, i) => (
+              <div key={i} style={{ color: "var(--bad)", fontWeight: "bold" }}>
+                ⚠ {w}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
         <div style={{ fontSize: 14, opacity: 0.75 }}>
@@ -1209,7 +1609,7 @@ export default function App() {
         </div>
       </div>
 
-      <div className="card" style={{ marginTop: 16 }}>
+      <div className="card" style={{ marginTop: 16, marginBottom: 16 }}>
         <h3>Compare Builds</h3>
 
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -1374,6 +1774,12 @@ export default function App() {
             </>
           )}
         </div>
+
+        {hardCompatibility.length > 0 && (
+          <span style={{ color: "red", fontWeight: "bold", marginLeft: 10 }}>
+            ❌ Incompatible
+          </span>
+        )}
       </div>
     </div>
   );
